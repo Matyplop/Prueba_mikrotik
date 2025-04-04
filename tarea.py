@@ -66,9 +66,9 @@ def get_mikrotik_logs(time_minutes=60):
     try:
         # Obtener logs del sistema
         log_path = api.path('/log')
-
-        # Convertir a lista y limitar la cantidad de registros obtenidos
-        logs = list(log_path)[:time_minutes * 5]  # Ajusta la cantidad de logs manualmente
+        
+        # Aumentar la cantidad de logs para no perder ninguno
+        logs = list(log_path)[:time_minutes * 10]  # Aumentado para capturar más logs
         
         return logs
     except Exception as e:
@@ -137,15 +137,18 @@ def find_recent_disconnections(time_minutes):
     logs = get_mikrotik_logs(time_minutes)
     
     if not logs:
-        return []
+        return [], []
     
-    # Filtrar los logs para encontrar desconexiones PPPoE
+    # Filtrar los logs para encontrar desconexiones PPPoE tradicionales
     disconnections = filter_pppoe_disconnections(logs)
+    
+    # Extraer todos los eventos de conexión PPPoE (desconexión, conexión, reconexión)
+    connection_events = extract_pppoe_connection_events(logs)
     
     # Guardar en el archivo de registro local
     save_disconnections_to_log(disconnections)
     
-    return disconnections
+    return disconnections, connection_events
 
 # Función para guardar desconexiones en el registro local
 def save_disconnections_to_log(disconnections):
@@ -201,6 +204,63 @@ def format_disconnections_for_display(disconnections):
     
     return df_display
 
+def extract_pppoe_connection_events(logs):
+    connection_events = []
+    
+    # Crear un diccionario para hacer seguimiento del estado de cada cliente
+    client_status = {}
+    
+    for log in logs:
+        if 'message' not in log or 'time' not in log:
+            continue
+            
+        message = log.get('message', '')
+        log_time = log.get('time', '')
+        
+        # Buscar mensajes relacionados con PPPoE
+        if '<pppoe-' in message:
+            # Extraer el nombre de usuario
+            username_match = re.search(r'<pppoe-(.*?)>', message)
+            if not username_match:
+                continue
+                
+            username = username_match.group(1)
+            event_type = None
+            
+            # Determinar el tipo de evento
+            if 'terminating' in message or 'disconnected' in message:
+                event_type = 'DESCONEXIÓN'
+            elif 'connected' in message:
+                event_type = 'CONEXIÓN'
+            
+            if event_type:
+                # Guardar el evento
+                connection_events.append({
+                    'Hora': log_time,
+                    'Cliente': username,
+                    'Evento': event_type,
+                    'Mensaje': message
+                })
+                
+                # Actualizar estado del cliente
+                if username not in client_status:
+                    client_status[username] = {'last_event': event_type, 'last_time': log_time}
+                else:
+                    # Verificar si es una reconexión rápida
+                    if (event_type == 'CONEXIÓN' and 
+                        client_status[username]['last_event'] == 'DESCONEXIÓN'):
+                        # Marcar como reconexión rápida
+                        connection_events.append({
+                            'Hora': log_time,
+                            'Cliente': username,
+                            'Evento': 'RECONEXIÓN RÁPIDA',
+                            'Mensaje': f"Reconexión detectada después de una desconexión"
+                        })
+                    
+                    client_status[username] = {'last_event': event_type, 'last_time': log_time}
+    
+    return connection_events
+
 # Función principal
 def main():
     try:
@@ -255,11 +315,53 @@ def main():
         # Botón para buscar desconexiones
         if st.button("🔍 Buscar desconexiones"):
             with st.spinner("Consultando logs del router..."):
-                # Buscar desconexiones en los logs del router
-                disconnections = find_recent_disconnections(time_options[selected_time])
+                # Buscar desconexiones y eventos de conexión
+                disconnections, connection_events = find_recent_disconnections(time_options[selected_time])
                 
+                if connection_events:
+                    # Mostrar todos los eventos de conexión PPPoE (incluidas reconexiones rápidas)
+                    st.subheader("📊 Eventos de Conexión PPPoE:")
+                    events_df = pd.DataFrame(connection_events)
+                    
+                    # Resaltar las reconexiones rápidas
+                    def highlight_reconnections(row):
+                        if row['Evento'] == 'RECONEXIÓN RÁPIDA':
+                            return ['background-color: #FFC107'] * len(row)
+                        elif row['Evento'] == 'DESCONEXIÓN':
+                            return ['background-color: #F44336; color: white'] * len(row)
+                        elif row['Evento'] == 'CONEXIÓN':
+                            return ['background-color: #4CAF50; color: white'] * len(row)
+                        else:
+                            return [''] * len(row)
+                    
+                    # Mostrar la tabla con formato
+                    st.dataframe(
+                        events_df.style.apply(highlight_reconnections, axis=1),
+                        use_container_width=True
+                    )
+                    
+                    # Filtrar solo reconexiones rápidas para destacarlas
+                    rapid_reconnections = [event for event in connection_events if event['Evento'] == 'RECONEXIÓN RÁPIDA']
+                    if rapid_reconnections:
+                        st.success(f"⚡ Se detectaron {len(rapid_reconnections)} reconexiones rápidas")
+                        
+                        # Mostrar los usuarios con reconexiones rápidas
+                        reconnection_users = set(event['Cliente'] for event in rapid_reconnections)
+                        st.info(f"Usuarios con reconexiones rápidas: {', '.join(reconnection_users)}")
+                    
+                    # Opción para exportar eventos
+                    events_csv = events_df.to_csv(index=False)
+                    st.download_button(
+                        label="📥 Descargar eventos de conexión como CSV",
+                        data=events_csv,
+                        file_name=f"eventos_pppoe_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                        mime="text/csv"
+                    )
+                
+                # Mostrar las desconexiones tradicionales
                 if disconnections:
-                    st.success(f"✅ Se encontraron {len(disconnections)} desconexiones recientes")
+                    st.subheader("🚫 Desconexiones detectadas:")
+                    st.success(f"✅ Se encontraron {len(disconnections)} desconexiones")
                     
                     # Formatear para mostrar
                     df_display = format_disconnections_for_display(disconnections)
@@ -270,14 +372,15 @@ def main():
                     # Opción para exportar datos
                     csv = df_display.to_csv(index=False)
                     st.download_button(
-                        label="📥 Descargar datos como CSV",
+                        label="📥 Descargar desconexiones como CSV",
                         data=csv,
                         file_name=f"desconexiones_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
                         mime="text/csv"
                     )
-                else:
-                    st.success(f"✅ No se detectaron desconexiones en los últimos {selected_time}")
-    
+                
+                if not connection_events and not disconnections:
+                    st.success(f"✅ No se detectaron eventos PPPoE en los últimos {selected_time}")
+        
     with col2:
         st.header("⚙️ Opciones")
     
@@ -320,7 +423,7 @@ def main():
                     st.warning("No se pudieron obtener los clientes activos")
 
         # Guardar los usuarios desconectados en session_state
-        disconnections = find_recent_disconnections(15)  # Últimos 15 minutos
+        disconnections, _ = find_recent_disconnections(15)  # Últimos 15 minutos
         if disconnections:
             disconnected_users = {dc['nombre'] for dc in disconnections}
             st.session_state.previous_disconnections.update(disconnected_users)
